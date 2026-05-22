@@ -10,6 +10,8 @@ const app = express();
 const BASE_URL = 'https://newerp.kluniversity.in';
 
 app.use(express.json());
+// Add this after app.use(express.json())
+app.get('/', (req, res) => res.json({ status: 'KLERP backend running' }))
 const allowedOrigins = [
   'http://localhost:5173',   // Vite dev server
   'http://localhost:4173',   // Vite preview
