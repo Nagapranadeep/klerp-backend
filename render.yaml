@@ -7,7 +7,7 @@ services:
     startCommand: npm start
     envVars:
       - key: FRONTEND_URL
-        value: https://your-vercel-app.vercel.app   # <-- update after deploying frontend
+        value: https://klerp-frontend.vercel.app/   # <-- update after deploying frontend
       - key: SESSION_SECRET
         generateValue: true
       - key: NODE_ENV
