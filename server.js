@@ -8,35 +8,46 @@ const { CookieJar } = require('tough-cookie');
 
 const app = express();
 const BASE_URL = 'https://newerp.kluniversity.in';
+const isProd = process.env.NODE_ENV === 'production';
 
 app.use(express.json());
-// Add this after app.use(express.json())
-app.get('/', (req, res) => res.json({ status: 'KLERP backend running' }))
+
+app.get('/', (req, res) => res.json({ status: 'KLERP backend running' }));
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 const allowedOrigins = [
-  'http://localhost:5173',   // Vite dev server
-  'http://localhost:4173',   // Vite preview
-  process.env.FRONTEND_URL,  // Production Vercel URL
+  'http://localhost:5173',
+  'http://localhost:4173',
+  process.env.FRONTEND_URL,
 ].filter(Boolean);
+
+console.log('=== STARTUP ===');
+console.log('NODE_ENV:', process.env.NODE_ENV);
+console.log('isProd:', isProd);
+console.log('Allowed origins:', allowedOrigins);
+console.log('===============');
 
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
+    console.error('CORS blocked:', origin, '| Allowed:', allowedOrigins);
     callback(new Error('CORS blocked: ' + origin));
   },
   credentials: true
 }));
+
 app.use(session({
   secret: process.env.SESSION_SECRET || 'klerp-secret-change-in-prod',
   resave: false,
   saveUninitialized: false,
   cookie: {
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-  maxAge: 8 * 60 * 60 * 1000
-}
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    maxAge: 8 * 60 * 60 * 1000
+  }
 }));
-console.log('Cookie config: secure=', process.env.NODE_ENV === 'production', 'sameSite=', process.env.NODE_ENV === 'production' ? 'none' : 'lax', 'NODE_ENV=', process.env.NODE_ENV);
+
 // ---------- helpers ----------
 
 function makeClient() {
@@ -55,7 +66,6 @@ function makeClient() {
   return { client, jar };
 }
 
-// Store per-session axios clients (keyed by session id)
 const sessionClients = {};
 
 function getClient(req) {
@@ -67,7 +77,6 @@ function getClient(req) {
 
 // ---------- routes ----------
 
-// GET /api/captcha  — fetch and proxy captcha image + csrf token
 app.get('/api/captcha', async (req, res) => {
   console.log('=== /api/captcha called ===');
   console.log('Session ID:', req.session.id);
@@ -78,8 +87,7 @@ app.get('/api/captcha', async (req, res) => {
     let loginPage;
     try {
       loginPage = await client.get('/index.php?r=site%2Flogin');
-      console.log('Login page status:', loginPage.status);
-      console.log('Login page data length:', loginPage.data?.length);
+      console.log('Login page status:', loginPage.status, 'length:', loginPage.data?.length);
     } catch (e) {
       console.error('FAILED to fetch login page:', e.message);
       return res.status(500).json({ error: 'Cannot reach KL University servers', detail: e.message });
@@ -94,17 +102,18 @@ app.get('/api/captcha', async (req, res) => {
     console.log('Captcha src:', captchaSrc);
 
     if (!captchaSrc) {
-      console.error('Captcha src not found in HTML. Page snippet:', loginPage.data?.slice(0, 500));
+      console.error('Captcha src not found. Page snippet:', loginPage.data?.slice(0, 500));
       return res.status(500).json({ error: 'Could not find captcha on KL login page' });
     }
-
-    const captchaUrl = BASE_URL + captchaSrc;
-    console.log('Step 2: Fetching captcha image from:', captchaUrl);
 
     req.session.csrf = csrf;
     await new Promise((resolve, reject) =>
       req.session.save(err => err ? reject(err) : resolve())
     );
+    console.log('Session saved with CSRF. Session ID:', req.session.id);
+
+    const captchaUrl = BASE_URL + captchaSrc;
+    console.log('Step 2: Fetching captcha image from:', captchaUrl);
 
     let imgResp;
     try {
@@ -121,19 +130,16 @@ app.get('/api/captcha', async (req, res) => {
 
     res.json({ captchaImage: `data:${mime};base64,${b64}`, csrf });
   } catch (err) {
-    console.error('Captcha unexpected error:', err.message, err.stack);
+    console.error('Captcha unexpected error:', err.message);
     res.status(500).json({ error: 'Failed to fetch captcha', detail: err.message });
   }
 });
 
-// POST /api/login
 app.post('/api/login', async (req, res) => {
-  console.log('=== /api/login called ===')
-  console.log('Session ID:', req.session.id)
-  console.log('Session CSRF:', req.session.csrf)
-  console.log('Session loggedIn:', req.session.loggedIn)
-  console.log('Body keys:', Object.keys(req.body))
-  
+  console.log('=== /api/login called ===');
+  console.log('Session ID:', req.session.id);
+  console.log('Session CSRF:', req.session.csrf ? 'PRESENT' : 'MISSING');
+
   const { username, password, captcha } = req.body;
   if (!username || !password || !captcha) {
     return res.status(400).json({ error: 'Missing fields' });
@@ -142,6 +148,11 @@ app.post('/api/login', async (req, res) => {
   try {
     const client = getClient(req);
     const csrf = req.session.csrf;
+
+    if (!csrf) {
+      console.error('No CSRF in session — session cookie not being sent by browser');
+      return res.status(400).json({ error: 'Session expired — please refresh and try again' });
+    }
 
     const params = new URLSearchParams();
     params.append('_csrf', csrf);
@@ -152,49 +163,56 @@ app.post('/api/login', async (req, res) => {
     params.append('LoginForm[qr_code]', '');
     params.append('login-button', '');
 
+    console.log('Posting login to KL...');
     const loginResp = await client.post('/index.php?r=site%2Flogin', params.toString(), {
-  headers: {
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'X-Requested-With': 'XMLHttpRequest',
-    'X-PJAX': 'true',
-    'X-PJAX-Container': '#login-jax'
-  },
-  maxRedirects: 0,
-  validateStatus: s => s < 400 || s === 302,
-});
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-PJAX': 'true',
+        'X-PJAX-Container': '#login-jax'
+      },
+      maxRedirects: 0,
+      validateStatus: s => s < 400 || s === 302,
+    });
 
-// 302 = successful login on KL's side
-if (loginResp.status === 302 || loginResp.headers?.location) {
-  req.session.loggedIn = true;
-  req.session.username = username;
-  return res.json({ success: true, username });
-}
+    console.log('KL login response status:', loginResp.status);
+
+    if (loginResp.status === 302 || loginResp.headers?.location) {
+      req.session.loggedIn = true;
+      req.session.username = username;
+      await new Promise((resolve, reject) =>
+        req.session.save(err => err ? reject(err) : resolve())
+      );
+      console.log('Login SUCCESS via 302');
+      return res.json({ success: true, username });
+    }
 
     const $ = cheerio.load(loginResp.data);
-
-    // Check for error messages
     const errorMsg = $('.help-block .text-danger').first().text().trim();
     if (errorMsg) {
+      console.log('KL login error message:', errorMsg);
       return res.status(401).json({ error: errorMsg });
     }
 
-    // Check if we landed on the dashboard (successful login redirects away from login form)
     const isStillLoginPage = $('#login-form').length > 0;
     if (isStillLoginPage) {
+      console.log('Still on login page — bad credentials or captcha');
       return res.status(401).json({ error: 'Invalid credentials or wrong captcha' });
     }
 
     req.session.loggedIn = true;
     req.session.username = username;
-
+    await new Promise((resolve, reject) =>
+      req.session.save(err => err ? reject(err) : resolve())
+    );
+    console.log('Login SUCCESS');
     res.json({ success: true, username });
   } catch (err) {
     console.error('Login error:', err.message);
-    res.status(500).json({ error: 'Login failed' });
+    res.status(500).json({ error: 'Login failed', detail: err.message });
   }
 });
 
-// Middleware: require session
 function requireLogin(req, res, next) {
   if (!req.session.loggedIn) {
     return res.status(401).json({ error: 'Not authenticated' });
@@ -202,7 +220,6 @@ function requireLogin(req, res, next) {
   next();
 }
 
-// GET /api/menu
 app.get('/api/menu', requireLogin, async (req, res) => {
   try {
     const client = getClient(req);
@@ -213,28 +230,23 @@ app.get('/api/menu', requireLogin, async (req, res) => {
   }
 });
 
-// Academic year label -> numeric ID mapping (from KL's select options)
 const ACADEMIC_YEAR_IDS = {
   '2026-2027': '29', '2025-2026': '19', '2024-2025': '16',
   '2023-2024': '15', '2022-2023': '14', '2021-2022': '13',
   '2020-2021': '10', '2019-2020': '9',  '2018-2019': '8',
 };
-// Semester label -> numeric ID
 const SEMESTER_IDS = {
   'Odd Sem': '1', 'Even Sem': '2', 'Summer Term': '3', 'Term3': '4'
 };
 
-// GET /api/attendance
 app.get('/api/attendance', requireLogin, async (req, res) => {
   try {
     const client = getClient(req);
     const { academicYear = '2025-2026', semesterId = 'Odd Sem' } = req.query;
 
-    // Convert human-readable labels to numeric IDs KL expects
     const yearId = ACADEMIC_YEAR_IDS[academicYear] || '19';
     const semId  = SEMESTER_IDS[semesterId] || '1';
 
-    // Step 1: GET the attendance page to grab a fresh CSRF token
     const pageResp = await client.get(
       '/index.php?r=studentattendance%2Fstudentdailyattendance%2Fsearchgetinput'
     );
@@ -246,8 +258,6 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
     console.log('Attendance CSRF:', csrf ? 'found' : 'MISSING');
     console.log('Posting yearId:', yearId, 'semId:', semId);
 
-    // Step 2: POST to the CORRECT endpoint (courselist, not searchgetinput)
-    // with the CORRECT field names (DynamicModel, not SearchForm)
     const params = new URLSearchParams();
     params.append('_csrf', csrf);
     params.append('DynamicModel[academicyear]', yearId);
@@ -270,7 +280,6 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
     const $2 = cheerio.load(searchResp.data);
     const rows = [];
 
-    // Table columns (0-indexed): # | Coursecode | Coursedesc | Ltps | Section | Year | Semester | Fr Date | Total Conducted | Total Attended | Total Absent | Tcbr | Percentage | Register
     $2('table tbody tr').each((i, row) => {
       const cells = $2(row).find('td');
       if (cells.length < 13) return;
@@ -291,8 +300,7 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
 
       const target = 0.75;
       const currentPct = conducted > 0 ? attended / conducted : 0;
-      let canMiss = 0;
-      let needAttend = 0;
+      let canMiss = 0, needAttend = 0;
 
       if (currentPct >= target) {
         canMiss = Math.floor(attended / target - conducted);
@@ -318,23 +326,18 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
   }
 });
 
-// GET /api/cgpa
 app.get('/api/cgpa', requireLogin, async (req, res) => {
   try {
     const client = getClient(req);
     const resp = await client.get('/index.php?r=site%2Findexindi');
     const $ = cheerio.load(resp.data);
-
-    // Extract CGPA from page — adjust selector if needed
     const cgpaText = $('[class*="cgpa"], [id*="cgpa"]').first().text().trim();
-
     res.json({ cgpa: cgpaText || 'N/A' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch CGPA' });
   }
 });
 
-// POST /api/logout
 app.post('/api/logout', (req, res) => {
   delete sessionClients[req.session.id];
   req.session.destroy();
@@ -344,4 +347,4 @@ app.post('/api/logout', (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () =>
   console.log(`KLERP backend running on port ${PORT}`)
-)
+);
