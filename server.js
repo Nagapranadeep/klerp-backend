@@ -2,9 +2,9 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
-const session = require('express-session');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
+const crypto = require('crypto');
 
 const app = express();
 const BASE_URL = 'https://newerp.kluniversity.in';
@@ -37,16 +37,27 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'klerp-secret-change-in-prod',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: isProd,
-    sameSite: isProd ? 'none' : 'lax',
-    maxAge: 8 * 60 * 60 * 1000
+app.use(express.json());
+
+// ---------- in-memory stores ----------
+
+// csrfClients: csrf -> { client, createdAt }   (pre-login, keyed by KL csrf token)
+// authTokens:  token -> { client, username, createdAt }  (post-login, keyed by our token)
+const csrfClients = {};
+const authTokens  = {};
+
+// Clean up stale entries every minute
+setInterval(() => {
+  const now = Date.now();
+  const csrfTTL = 10 * 60 * 1000;   // 10 min for captcha/csrf
+  const authTTL = 8 * 60 * 60 * 1000; // 8 hours for auth tokens
+  for (const [k, v] of Object.entries(csrfClients)) {
+    if (now - v.createdAt > csrfTTL) delete csrfClients[k];
   }
-}));
+  for (const [k, v] of Object.entries(authTokens)) {
+    if (now - v.createdAt > authTTL) delete authTokens[k];
+  }
+}, 60 * 1000);
 
 // ---------- helpers ----------
 
@@ -66,25 +77,15 @@ function makeClient() {
   return { client, jar };
 }
 
-// Two maps:
-// sessionClients: sessionId -> { client, jar }  (for logged-in routes)
-// csrfClients:    csrf token -> { client, jar }  (for login flow, bypasses cookie issue)
-const sessionClients = {};
-const csrfClients = {};
-
-// Clean up csrf clients older than 10 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [key, entry] of Object.entries(csrfClients)) {
-    if (entry.createdAt < cutoff) delete csrfClients[key];
+function requireAuth(req, res, next) {
+  const token = req.headers['x-auth-token'];
+  if (!token || !authTokens[token]) {
+    console.log('requireAuth failed. Token:', token ? 'present but not found' : 'missing');
+    return res.status(401).json({ error: 'Not authenticated' });
   }
-}, 60 * 1000);
-
-function getSessionClient(req) {
-  if (!sessionClients[req.session.id]) {
-    sessionClients[req.session.id] = makeClient();
-  }
-  return sessionClients[req.session.id].client;
+  req.klClient = authTokens[token].client;
+  req.username = authTokens[token].username;
+  next();
 }
 
 // ---------- routes ----------
@@ -92,9 +93,8 @@ function getSessionClient(req) {
 app.get('/api/captcha', async (req, res) => {
   console.log('=== /api/captcha called ===');
   try {
-    const { client } = makeClient(); // always fresh client for captcha
+    const { client } = makeClient();
 
-    console.log('Fetching KL login page...');
     let loginPage;
     try {
       loginPage = await client.get('/index.php?r=site%2Flogin');
@@ -110,24 +110,18 @@ app.get('/api/captcha', async (req, res) => {
     console.log('CSRF found:', csrf ? 'YES' : 'NO');
 
     const captchaSrc = $('#loginFormCaptcha-image').attr('src');
-    console.log('Captcha src:', captchaSrc);
-
     if (!captchaSrc) {
-      console.error('Captcha src not found. Page snippet:', loginPage.data?.slice(0, 500));
+      console.error('Captcha src not found. Snippet:', loginPage.data?.slice(0, 500));
       return res.status(500).json({ error: 'Could not find captcha on KL login page' });
     }
 
-    // Store client keyed by CSRF — no session cookie needed
     csrfClients[csrf] = { client, createdAt: Date.now() };
-    console.log('Stored client for CSRF token');
 
     const captchaUrl = BASE_URL + captchaSrc;
-    console.log('Fetching captcha image...');
-
     let imgResp;
     try {
       imgResp = await client.get(captchaUrl, { responseType: 'arraybuffer' });
-      console.log('Captcha image status:', imgResp.status, 'size:', imgResp.data?.byteLength);
+      console.log('Captcha image size:', imgResp.data?.byteLength);
     } catch (e) {
       console.error('FAILED to fetch captcha image:', e.message);
       return res.status(500).json({ error: 'Could not fetch captcha image', detail: e.message });
@@ -146,22 +140,18 @@ app.get('/api/captcha', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   console.log('=== /api/login called ===');
-  console.log('Session ID:', req.session.id);
 
   const { username, password, captcha, csrf } = req.body;
   if (!username || !password || !captcha || !csrf) {
-    console.error('Missing fields:', { username: !!username, password: !!password, captcha: !!captcha, csrf: !!csrf });
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  // Look up the KL axios client by CSRF token (bypasses session cookie issue)
   const csrfEntry = csrfClients[csrf];
   if (!csrfEntry) {
-    console.error('No client found for CSRF token — captcha may have expired');
+    console.error('No client found for CSRF token');
     return res.status(400).json({ error: 'Captcha expired — please refresh and try again' });
   }
   const client = csrfEntry.client;
-  console.log('Found KL client for CSRF token');
 
   try {
     const params = new URLSearchParams();
@@ -187,59 +177,38 @@ app.post('/api/login', async (req, res) => {
 
     console.log('KL login response status:', loginResp.status);
 
-    if (loginResp.status === 302 || loginResp.headers?.location) {
-      // Move client from csrfClients to sessionClients now that we have a good session
-      sessionClients[req.session.id] = csrfEntry;
-      delete csrfClients[csrf];
-      req.session.loggedIn = true;
-      req.session.username = username;
-      await new Promise((resolve, reject) =>
-        req.session.save(err => err ? reject(err) : resolve())
-      );
-      console.log('Login SUCCESS via 302');
-      return res.json({ success: true, username });
+    const isSuccess = loginResp.status === 302 || loginResp.headers?.location;
+    if (!isSuccess) {
+      const $ = cheerio.load(loginResp.data);
+      const errorMsg = $('.help-block .text-danger').first().text().trim();
+      if (errorMsg) return res.status(401).json({ error: errorMsg });
+      if ($('#login-form').length > 0) {
+        return res.status(401).json({ error: 'Invalid credentials or wrong captcha' });
+      }
     }
 
-    const $ = cheerio.load(loginResp.data);
-    const errorMsg = $('.help-block .text-danger').first().text().trim();
-    if (errorMsg) {
-      console.log('KL login error:', errorMsg);
-      return res.status(401).json({ error: errorMsg });
-    }
-
-    const isStillLoginPage = $('#login-form').length > 0;
-    if (isStillLoginPage) {
-      console.log('Still on login page — bad credentials or captcha');
-      return res.status(401).json({ error: 'Invalid credentials or wrong captcha' });
-    }
-
-    // Success without 302
-    sessionClients[req.session.id] = csrfEntry;
+    // Generate our own auth token — no cookies needed
+    const authToken = crypto.randomBytes(32).toString('hex');
+    authTokens[authToken] = { client, username, createdAt: Date.now() };
     delete csrfClients[csrf];
-    req.session.loggedIn = true;
-    req.session.username = username;
-    await new Promise((resolve, reject) =>
-      req.session.save(err => err ? reject(err) : resolve())
-    );
-    console.log('Login SUCCESS');
-    res.json({ success: true, username });
+
+    console.log('Login SUCCESS. Auth token issued.');
+    res.json({ success: true, username, authToken });
   } catch (err) {
     console.error('Login error:', err.message);
     res.status(500).json({ error: 'Login failed', detail: err.message });
   }
 });
 
-function requireLogin(req, res, next) {
-  if (!req.session.loggedIn) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  next();
-}
+app.post('/api/logout', (req, res) => {
+  const token = req.headers['x-auth-token'];
+  if (token) delete authTokens[token];
+  res.json({ success: true });
+});
 
-app.get('/api/menu', requireLogin, async (req, res) => {
+app.get('/api/menu', requireAuth, async (req, res) => {
   try {
-    const client = getSessionClient(req);
-    const resp = await client.get('/js/menu-student.json');
+    const resp = await req.klClient.get('/js/menu-student.json');
     res.json(resp.data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch menu' });
@@ -255,15 +224,13 @@ const SEMESTER_IDS = {
   'Odd Sem': '1', 'Even Sem': '2', 'Summer Term': '3', 'Term3': '4'
 };
 
-app.get('/api/attendance', requireLogin, async (req, res) => {
+app.get('/api/attendance', requireAuth, async (req, res) => {
   try {
-    const client = getSessionClient(req);
     const { academicYear = '2025-2026', semesterId = 'Odd Sem' } = req.query;
-
     const yearId = ACADEMIC_YEAR_IDS[academicYear] || '19';
     const semId  = SEMESTER_IDS[semesterId] || '1';
 
-    const pageResp = await client.get(
+    const pageResp = await req.klClient.get(
       '/index.php?r=studentattendance%2Fstudentdailyattendance%2Fsearchgetinput'
     );
     const $ = cheerio.load(pageResp.data);
@@ -277,7 +244,7 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
     params.append('DynamicModel[academicyear]', yearId);
     params.append('DynamicModel[semesterid]', semId);
 
-    const searchResp = await client.post(
+    const searchResp = await req.klClient.post(
       '/index.php?r=studentattendance%2Fstudentdailyattendance%2Fcourselist',
       params.toString(),
       {
@@ -290,7 +257,6 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
     );
 
     console.log('Attendance response length:', searchResp.data.length);
-
     const $2 = cheerio.load(searchResp.data);
     const rows = [];
 
@@ -299,6 +265,8 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
       if (cells.length < 13) return;
 
       const courseCode = $2(cells[1]).text().trim();
+      if (!courseCode) return;
+
       const courseDesc = $2(cells[2]).text().trim();
       const ltps       = $2(cells[3]).text().trim();
       const section    = $2(cells[4]).text().trim();
@@ -309,8 +277,6 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
       const absent     = parseInt($2(cells[10]).text().trim()) || 0;
       const tcbr       = parseInt($2(cells[11]).text().trim()) || 0;
       const pctText    = $2(cells[12]).text().trim().replace('%', '');
-
-      if (!courseCode) return;
 
       const target = 0.75;
       const currentPct = conducted > 0 ? attended / conducted : 0;
@@ -340,22 +306,15 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
   }
 });
 
-app.get('/api/cgpa', requireLogin, async (req, res) => {
+app.get('/api/cgpa', requireAuth, async (req, res) => {
   try {
-    const client = getSessionClient(req);
-    const resp = await client.get('/index.php?r=site%2Findexindi');
+    const resp = await req.klClient.get('/index.php?r=site%2Findexindi');
     const $ = cheerio.load(resp.data);
     const cgpaText = $('[class*="cgpa"], [id*="cgpa"]').first().text().trim();
     res.json({ cgpa: cgpaText || 'N/A' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch CGPA' });
   }
-});
-
-app.post('/api/logout', (req, res) => {
-  delete sessionClients[req.session.id];
-  req.session.destroy();
-  res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3001;
