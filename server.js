@@ -66,9 +66,21 @@ function makeClient() {
   return { client, jar };
 }
 
+// Two maps:
+// sessionClients: sessionId -> { client, jar }  (for logged-in routes)
+// csrfClients:    csrf token -> { client, jar }  (for login flow, bypasses cookie issue)
 const sessionClients = {};
+const csrfClients = {};
 
-function getClient(req) {
+// Clean up csrf clients older than 10 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [key, entry] of Object.entries(csrfClients)) {
+    if (entry.createdAt < cutoff) delete csrfClients[key];
+  }
+}, 60 * 1000);
+
+function getSessionClient(req) {
   if (!sessionClients[req.session.id]) {
     sessionClients[req.session.id] = makeClient();
   }
@@ -79,11 +91,10 @@ function getClient(req) {
 
 app.get('/api/captcha', async (req, res) => {
   console.log('=== /api/captcha called ===');
-  console.log('Session ID:', req.session.id);
   try {
-    const client = getClient(req);
+    const { client } = makeClient(); // always fresh client for captcha
 
-    console.log('Step 1: Fetching KL login page...');
+    console.log('Fetching KL login page...');
     let loginPage;
     try {
       loginPage = await client.get('/index.php?r=site%2Flogin');
@@ -106,14 +117,12 @@ app.get('/api/captcha', async (req, res) => {
       return res.status(500).json({ error: 'Could not find captcha on KL login page' });
     }
 
-    req.session.csrf = csrf;
-    await new Promise((resolve, reject) =>
-      req.session.save(err => err ? reject(err) : resolve())
-    );
-    console.log('Session saved with CSRF. Session ID:', req.session.id);
+    // Store client keyed by CSRF — no session cookie needed
+    csrfClients[csrf] = { client, createdAt: Date.now() };
+    console.log('Stored client for CSRF token');
 
     const captchaUrl = BASE_URL + captchaSrc;
-    console.log('Step 2: Fetching captcha image from:', captchaUrl);
+    console.log('Fetching captcha image...');
 
     let imgResp;
     try {
@@ -138,22 +147,23 @@ app.get('/api/captcha', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   console.log('=== /api/login called ===');
   console.log('Session ID:', req.session.id);
-  console.log('Session CSRF:', req.session.csrf ? 'PRESENT' : 'MISSING');
 
-  const { username, password, captcha } = req.body;
-  if (!username || !password || !captcha) {
+  const { username, password, captcha, csrf } = req.body;
+  if (!username || !password || !captcha || !csrf) {
+    console.error('Missing fields:', { username: !!username, password: !!password, captcha: !!captcha, csrf: !!csrf });
     return res.status(400).json({ error: 'Missing fields' });
   }
 
+  // Look up the KL axios client by CSRF token (bypasses session cookie issue)
+  const csrfEntry = csrfClients[csrf];
+  if (!csrfEntry) {
+    console.error('No client found for CSRF token — captcha may have expired');
+    return res.status(400).json({ error: 'Captcha expired — please refresh and try again' });
+  }
+  const client = csrfEntry.client;
+  console.log('Found KL client for CSRF token');
+
   try {
-    const client = getClient(req);
-    const csrf = req.session.csrf || req.body.csrf;
-
-    if (!csrf) {
-      console.error('No CSRF in session — session cookie not being sent by browser');
-      return res.status(400).json({ error: 'Session expired — please refresh and try again' });
-    }
-
     const params = new URLSearchParams();
     params.append('_csrf', csrf);
     params.append('LoginForm[username]', username);
@@ -178,6 +188,9 @@ app.post('/api/login', async (req, res) => {
     console.log('KL login response status:', loginResp.status);
 
     if (loginResp.status === 302 || loginResp.headers?.location) {
+      // Move client from csrfClients to sessionClients now that we have a good session
+      sessionClients[req.session.id] = csrfEntry;
+      delete csrfClients[csrf];
       req.session.loggedIn = true;
       req.session.username = username;
       await new Promise((resolve, reject) =>
@@ -190,7 +203,7 @@ app.post('/api/login', async (req, res) => {
     const $ = cheerio.load(loginResp.data);
     const errorMsg = $('.help-block .text-danger').first().text().trim();
     if (errorMsg) {
-      console.log('KL login error message:', errorMsg);
+      console.log('KL login error:', errorMsg);
       return res.status(401).json({ error: errorMsg });
     }
 
@@ -200,6 +213,9 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials or wrong captcha' });
     }
 
+    // Success without 302
+    sessionClients[req.session.id] = csrfEntry;
+    delete csrfClients[csrf];
     req.session.loggedIn = true;
     req.session.username = username;
     await new Promise((resolve, reject) =>
@@ -222,7 +238,7 @@ function requireLogin(req, res, next) {
 
 app.get('/api/menu', requireLogin, async (req, res) => {
   try {
-    const client = getClient(req);
+    const client = getSessionClient(req);
     const resp = await client.get('/js/menu-student.json');
     res.json(resp.data);
   } catch (err) {
@@ -241,7 +257,7 @@ const SEMESTER_IDS = {
 
 app.get('/api/attendance', requireLogin, async (req, res) => {
   try {
-    const client = getClient(req);
+    const client = getSessionClient(req);
     const { academicYear = '2025-2026', semesterId = 'Odd Sem' } = req.query;
 
     const yearId = ACADEMIC_YEAR_IDS[academicYear] || '19';
@@ -252,11 +268,9 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
     );
     const $ = cheerio.load(pageResp.data);
     const csrf = $('meta[name="csrf-token"]').attr('content') ||
-                 $('input[name="_csrf"]').val() ||
-                 req.session.csrf;
+                 $('input[name="_csrf"]').val();
 
     console.log('Attendance CSRF:', csrf ? 'found' : 'MISSING');
-    console.log('Posting yearId:', yearId, 'semId:', semId);
 
     const params = new URLSearchParams();
     params.append('_csrf', csrf);
@@ -328,7 +342,7 @@ app.get('/api/attendance', requireLogin, async (req, res) => {
 
 app.get('/api/cgpa', requireLogin, async (req, res) => {
   try {
-    const client = getClient(req);
+    const client = getSessionClient(req);
     const resp = await client.get('/index.php?r=site%2Findexindi');
     const $ = cheerio.load(resp.data);
     const cgpaText = $('[class*="cgpa"], [id*="cgpa"]').first().text().trim();
