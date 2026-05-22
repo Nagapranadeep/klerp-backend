@@ -36,7 +36,7 @@ app.use(session({
   maxAge: 8 * 60 * 60 * 1000
 }
 }));
-
+console.log('Cookie config: secure=', process.env.NODE_ENV === 'production', 'sameSite=', process.env.NODE_ENV === 'production' ? 'none' : 'lax', 'NODE_ENV=', process.env.NODE_ENV);
 // ---------- helpers ----------
 
 function makeClient() {
