@@ -128,6 +128,12 @@ app.get('/api/captcha', async (req, res) => {
 
 // POST /api/login
 app.post('/api/login', async (req, res) => {
+  console.log('=== /api/login called ===')
+  console.log('Session ID:', req.session.id)
+  console.log('Session CSRF:', req.session.csrf)
+  console.log('Session loggedIn:', req.session.loggedIn)
+  console.log('Body keys:', Object.keys(req.body))
+  
   const { username, password, captcha } = req.body;
   if (!username || !password || !captcha) {
     return res.status(400).json({ error: 'Missing fields' });
