@@ -69,35 +69,60 @@ function getClient(req) {
 
 // GET /api/captcha  — fetch and proxy captcha image + csrf token
 app.get('/api/captcha', async (req, res) => {
+  console.log('=== /api/captcha called ===');
+  console.log('Session ID:', req.session.id);
   try {
     const client = getClient(req);
 
-    // Step 1: get login page to grab CSRF token
-    const loginPage = await client.get('/index.php?r=site%2Flogin');
+    console.log('Step 1: Fetching KL login page...');
+    let loginPage;
+    try {
+      loginPage = await client.get('/index.php?r=site%2Flogin');
+      console.log('Login page status:', loginPage.status);
+      console.log('Login page data length:', loginPage.data?.length);
+    } catch (e) {
+      console.error('FAILED to fetch login page:', e.message);
+      return res.status(500).json({ error: 'Cannot reach KL University servers', detail: e.message });
+    }
+
     const $ = cheerio.load(loginPage.data);
-    
     const csrf = $('meta[name="csrf-token"]').attr('content') ||
                  $('input[name="_csrf"]').val();
+    console.log('CSRF found:', csrf ? 'YES' : 'NO');
 
-    // Step 2: get captcha image URL (src has a random v= param)
     const captchaSrc = $('#loginFormCaptcha-image').attr('src');
+    console.log('Captcha src:', captchaSrc);
+
+    if (!captchaSrc) {
+      console.error('Captcha src not found in HTML. Page snippet:', loginPage.data?.slice(0, 500));
+      return res.status(500).json({ error: 'Could not find captcha on KL login page' });
+    }
+
     const captchaUrl = BASE_URL + captchaSrc;
+    console.log('Step 2: Fetching captcha image from:', captchaUrl);
 
-    // Store CSRF in session for later login use
     req.session.csrf = csrf;
+    await new Promise((resolve, reject) =>
+      req.session.save(err => err ? reject(err) : resolve())
+    );
 
-    // Step 3: fetch the actual captcha image and stream it to frontend
-    const imgResp = await client.get(captchaUrl, { responseType: 'arraybuffer' });
+    let imgResp;
+    try {
+      imgResp = await client.get(captchaUrl, { responseType: 'arraybuffer' });
+      console.log('Captcha image status:', imgResp.status, 'size:', imgResp.data?.byteLength);
+    } catch (e) {
+      console.error('FAILED to fetch captcha image:', e.message);
+      return res.status(500).json({ error: 'Could not fetch captcha image', detail: e.message });
+    }
+
     const b64 = Buffer.from(imgResp.data).toString('base64');
     const mime = imgResp.headers['content-type'] || 'image/png';
+    console.log('=== /api/captcha SUCCESS ===');
 
-    res.json({
-      captchaImage: `data:${mime};base64,${b64}`,
-      csrf
-    });
+    res.json({ captchaImage: `data:${mime};base64,${b64}`, csrf });
   } catch (err) {
-    console.error('Captcha error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch captcha' });
+    console.error('Captcha unexpected error:', err.message, err.stack);
+    res.status(500).json({ error: 'Failed to fetch captcha', detail: err.message });
   }
 });
 
