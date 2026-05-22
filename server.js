@@ -147,7 +147,7 @@ app.post('/api/login', async (req, res) => {
 
   try {
     const client = getClient(req);
-    const csrf = req.session.csrf;
+    const csrf = req.session.csrf || req.body.csrf;
 
     if (!csrf) {
       console.error('No CSRF in session — session cookie not being sent by browser');
