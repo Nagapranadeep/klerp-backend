@@ -28,7 +28,11 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'klerp-secret-change-in-prod',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 8 * 60 * 60 * 1000 } // 8 hours
+  cookie: {
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  maxAge: 8 * 60 * 60 * 1000
+}
 }));
 
 // ---------- helpers ----------
@@ -305,4 +309,6 @@ app.post('/api/logout', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`KLERP backend running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`KLERP backend running on port ${PORT}`)
+)
